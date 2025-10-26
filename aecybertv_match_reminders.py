@@ -6,6 +6,8 @@ and schedules reminders at 60m, 15m, and Kick-off (Asia/Dubai).
 
 Commands:
   /start            - Help text
+  /ping             - Quick debug (expects "pong ✅")
+  /testreminder     - Sends a fake reminder in ~10s (for end-to-end test)
   /liveon           - Subscribe to reminders
   /liveoff          - Unsubscribe
   /today            - Quick digest of today's fixtures (no scheduling)
@@ -13,29 +15,34 @@ Commands:
   /autoday_on       - Auto-pull daily @ 09:00 Dubai
   /autoday_off      - Stop auto-pull
 
+Env (must set on Render):
+  BOT_TOKEN=xxxxxxxx:yyyyyyyy                 (REQUIRED)
+  APIFOOTBALL_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxx  (REQUIRED)
+  ADMIN_CHAT_ID=123456789                     (optional for startup DM)
+  APIFOOTBALL_BASE=https://v3.football.api-sports.io  (optional)
+
 Requirements:
   python-telegram-bot==21.4
   httpx>=0.27
-
-Env:
-  BOT_TOKEN=xxxxxxxx:yyyyyyyy
-  APIFOOTBALL_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  (optional) APIFOOTBALL_BASE=https://v3.football.api-sports.io
 """
 
 import os
 import logging
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import httpx
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, JobQueue
+)
 
 # ----------------------- CONFIG -----------------------
 TZ = ZoneInfo("Asia/Dubai")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # optional (string), convert to int where used
 
 BASE_URL = os.getenv("APIFOOTBALL_BASE", "https://v3.football.api-sports.io")
 API_KEY  = os.getenv("APIFOOTBALL_KEY", "").strip()
@@ -44,7 +51,7 @@ HEADERS  = {"x-apisports-key": API_KEY}
 # Countries (API uses "England", not "UK")
 COUNTRIES = ["Spain", "England", "Italy", "France", "Saudi Arabia", "UAE"]
 
-# Reminders offsets (minutes before KO); 0 = at KO  (keep hardcoded as you requested)
+# Reminders offsets (minutes before KO); 0 = at KO
 REMINDER_OFFSETS = [60, 15, 0]
 
 # Daily pull time (Dubai)
@@ -210,6 +217,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "مرحبًا! هذا العامل يرسل تذكيرات المباريات تلقائيًا.\n"
         "الأوامر:\n"
+        "• /ping — فحص سريع\n"
+        "• /testreminder — تذكير وهمي بعد 10 ثوانٍ (للاختبار)\n"
         "• /liveon — تفعيل استلام التذكيرات\n"
         "• /liveoff — إيقاف التذكيرات\n"
         "• /today — عرض ملخص مباريات اليوم (مختصر)\n"
@@ -217,6 +226,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /autoday_on — تشغيل سحب وجدولة يومي 09:00 دبي\n"
         "• /autoday_off — إيقاف التشغيل اليومي"
     )
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def testreminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # fires a fake reminder in ~10 seconds
+    ko = datetime.now(TZ) + timedelta(seconds=10)
+    data = {"home": "برشلونة", "away": "اختبار", "ko": ko, "league": "Test League", "label": "🧪 تذكير تجريبي"}
+    context.job_queue.run_once(send_reminder_job, when=10, data=data, name="test-reminder")
+    SUBSCRIBERS.add(update.effective_chat.id)
+    await update.message.reply_text("⏳ سيتم إرسال تذكير تجريبي خلال 10 ثوانٍ.")
 
 async def liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
@@ -227,6 +247,7 @@ async def liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔕 تم إيقاف التذكيرات.")
 
 async def autoday_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # daily job at 09:00 Dubai
     context.job_queue.run_daily(pull_and_schedule, time=DAILY_PULL_TIME, name="autoday-pull")
     await update.message.reply_text("✅ تشغيل تلقائي يومي: 09:00 بتوقيت دبي.")
 
@@ -277,10 +298,28 @@ async def today_fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await pull_and_schedule(context)
     await update.message.reply_text("✅ تم جلب مباريات اليوم وجدولة التذكيرات.")
 
+# -------------------- STARTUP NOTICE ------------------
+async def notify_startup(app: Application):
+    if ADMIN_CHAT_ID:
+        try:
+            await app.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text="✅ Reminders worker is live.")
+        except Exception as e:
+            log.warning("Startup DM failed: %s", e)
+
 # --------------------- APPLICATION -------------------
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
+
+    # Ensure JobQueue exists even if PTB was installed without the [job-queue] extra
+    if app.job_queue is None:
+        jq = JobQueue()
+        jq.set_application(app)
+        jq.start()
+
+    # Handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("testreminder", testreminder))
     app.add_handler(CommandHandler("liveon", liveon))
     app.add_handler(CommandHandler("liveoff", liveoff))
     app.add_handler(CommandHandler("today", today))
@@ -290,6 +329,10 @@ def build_app(token: str) -> Application:
 
     # Safety: first pull a few seconds after boot (useful if you deploy midday)
     app.job_queue.run_once(pull_and_schedule, when=5, name="boot-pull")
+
+    # Optional: DM on startup
+    app.post_init = lambda _: notify_startup(app)
+
     return app
 
 if __name__ == "__main__":
